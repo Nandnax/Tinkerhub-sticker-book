@@ -366,7 +366,7 @@ body.loaded .masthead{transition-delay:.15s}body.loaded .letters{transition-dela
   </div>
   <div class="bscroll">
     <div id="paneC" role="tabpanel" aria-labelledby="tabC">
-      <p class="bnote">Who owns the most TinkerHub stickers right now. Updates live as people add theirs.</p>
+      <p class="bnote">Who owns the most TinkerHub stickers right now. Updates live as people add theirs. Write your name to load your collection.</p>
       <ol class="ranks" id="rankList"></ol>
       <section class="mine" aria-labelledby="mineH">
         <h3 id="mineH">Count your stickers</h3>
@@ -424,13 +424,13 @@ body.loaded .masthead{transition-delay:.15s}body.loaded .letters{transition-dela
      Leave either as "" and the card shows that it hasn't been added yet.
      =================================================================== -->
 <!-- ===================================================================
-     SELF-HOSTING: paste your Firebase web config here so every visitor
-     can add to the leaderboard and rate stickers (see README.md).
-     Leave it as null on claude.ai — the page uses claude.ai's database there.
+     SELF-HOSTING (GitHub Pages): config.js is generated at deploy time by
+     .github/workflows/deploy.yml from the repository variables
+     SUPABASE_URL and SUPABASE_ANON_KEY. It only ever contains the PUBLIC
+     anon/publishable key. On claude.ai it is absent and the page uses
+     claude.ai's own database instead.
      =================================================================== -->
-<script>
-window.FIREBASE_CONFIG = window.FIREBASE_CONFIG || null;
-</script>
+<script src="config.js"></script>
 <script>
 const STICKERS = [
   {
@@ -1251,7 +1251,7 @@ scrim.addEventListener('click', closeIndex);
 /* =====================================================================
    LIVE: leaderboard + ratings (shared through the artifact's db)
    ===================================================================== */
-const Live = { db: null, uid: null, canWrite: false, ready: false, board: [], all: {}, mine: {}, have: new Set(), name: '', onBoard: false, err: '' };
+const Live = { mode: '', db: null, uid: null, canWrite: false, ready: false, board: [], all: {}, mine: {}, have: new Set(), name: '', onBoard: false, err: '', msg: '' };
 const STAR_PATH = 'M12 1.8l3 7 7.6.6-5.8 5 1.8 7.4L12 17.8 5.4 21.8l1.8-7.4-5.8-5 7.6-.6z';
 function starSvg(fill, stroke){ return `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${STAR_PATH}" fill="${fill}" stroke="${stroke || '#231F20'}" stroke-width="1.6" stroke-linejoin="round"/></svg>`; }
 function avgOf(id){ const a = Live.all[id]; return a && a.n ? { avg: a.sum / a.n, n: a.n } : { avg: 0, n: 0 }; }
@@ -1264,7 +1264,7 @@ function writeErr(e){
 
 /* Where the shared data lives:
    - opened on claude.ai  -> the artifact's built-in database
-   - self-hosted (GitHub Pages etc.) -> Firebase, using FIREBASE_CONFIG at the top of this file
+   - self-hosted (GitHub Pages) -> Supabase, using SUPABASE_CONFIG from config.js
    Both are wrapped to the same small API: collection().orderBy().limit().onSnapshot(), doc().get/set/delete */
 function loadScript(src){ return new Promise((res, rej) => { const el = document.createElement('script'); el.src = src; el.onload = res; el.onerror = rej; document.head.appendChild(el); }); }
 async function artifactBackend(){
@@ -1274,24 +1274,132 @@ async function artifactBackend(){
   const cw = user ? await user.can('data.write') : null;
   return { db, uid, canWrite: !!uid && cw !== false };
 }
-async function firebaseBackend(cfg){
-  const V = '10.12.2';
-  await loadScript(`https://www.gstatic.com/firebasejs/${V}/firebase-app-compat.js`);
-  await Promise.all([loadScript(`https://www.gstatic.com/firebasejs/${V}/firebase-auth-compat.js`), loadScript(`https://www.gstatic.com/firebasejs/${V}/firebase-firestore-compat.js`)]);
-  if (!firebase.apps.length) firebase.initializeApp(cfg);
-  const cred = await firebase.auth().signInAnonymously();   // every visitor gets a private, anonymous id
-  const fs = firebase.firestore();
-  const wrapDocSnap = d => ({ id: d.id, exists: d.exists, data: () => d.data() });
-  const wrapQ = q => ({
-    orderBy: (f, dir) => wrapQ(q.orderBy(f, dir)),
-    limit: n => wrapQ(q.limit(n)),
-    onSnapshot: (next, err) => q.onSnapshot(snap => next({ docs: snap.docs.map(wrapDocSnap), size: snap.size, empty: snap.empty }), err)
+/* ---------- Supabase (GitHub Pages) ----------
+   Tables are read-only to the public key; every write goes through
+   validated database functions (see supabase/schema.sql). */
+const SUPABASE_JS = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js';
+const SB = { client: null, voter: null, boundKey: null, boundName: '', draft: false, lookupSeq: 0, nameT: null, pending: false, subscribed: false, pollT: null };
+function normName(v){ return String(v || '').normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase(); }
+function looksLikeSecretKey(k){
+  if (/^sb_secret_/.test(k)) return true;
+  try { const p = JSON.parse(atob(k.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))); return p.role === 'service_role'; } catch (e) { return false; }
+}
+function sbVoterId(){
+  let v = null; try { v = localStorage.getItem('th-voter'); } catch (e) {}
+  if (!v || !/^[0-9a-f-]{36}$/i.test(v)){
+    v = (crypto.randomUUID ? crypto.randomUUID() : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => { const r = crypto.getRandomValues(new Uint8Array(1))[0] & 15; return (c === 'x' ? r : (r & 3) | 8).toString(16); }));
+    try { localStorage.setItem('th-voter', v); } catch (e) {}
+  }
+  return v;
+}
+function sbFriendly(err){
+  const m = (err && err.message) || '';
+  if (/Unknown sticker/i.test(m)) return 'One of those stickers isn’t recognised. Reload the page and try again.';
+  if (/Name must be|invalid characters/i.test(m)) return 'Names need 1–32 normal characters.';
+  return 'Couldn’t save just now. Check your connection and try again.';
+}
+function debounce(fn, ms){ let t; return () => { clearTimeout(t); t = setTimeout(fn, ms); }; }
+
+async function sbFetchBoard(){
+  const { data, error } = await SB.client.from('collections')
+    .select('display_name,name_key,sticker_count')
+    .gt('sticker_count', 0)
+    .order('sticker_count', { ascending: false })
+    .order('name_key', { ascending: true })
+    .limit(100);
+  if (error) throw error;
+  Live.board = data.map(r => ({ id: r.name_key, name: r.display_name, count: r.sticker_count }));
+  renderBoard();
+}
+async function sbFetchStats(){
+  const { data, error } = await SB.client.from('sticker_rating_stats').select('sticker_id,rating_sum,rating_count');
+  if (error) throw error;
+  const all = {}; data.forEach(r => { if (r.rating_count > 0) all[r.sticker_id] = { sum: r.rating_sum, n: r.rating_count }; });
+  Live.all = all; renderTop(); if (current >= 0) renderCardLive(STICKERS[current]);
+}
+async function sbLoadMyRatings(){
+  const { data, error } = await SB.client.rpc('get_my_ratings', { p_voter: SB.voter });
+  if (error) throw error;
+  const mine = {}; data.forEach(r => { mine[r.sticker_id] = r.stars; }); Live.mine = mine;
+}
+function sbSetDot(state){
+  const dot = $('liveDot');
+  dot.textContent = state === 'live' ? 'Live' : state === 'poll' ? 'Updating' : 'Offline';
+  dot.classList.toggle('off', state !== 'live');
+}
+function sbSubscribe(){
+  const refreshBoard = debounce(() => sbFetchBoard().catch(() => {}), 250);
+  const refreshStats = debounce(() => sbFetchStats().catch(() => {}), 250);
+  const startPolling = () => { if (!SB.pollT) SB.pollT = setInterval(() => { refreshBoard(); refreshStats(); }, 15000); };
+  SB.client.channel('sticker-book')
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'collections' }, refreshBoard)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'sticker_rating_stats' }, refreshStats)
+    .subscribe(status => {
+      if (status === 'SUBSCRIBED'){ SB.subscribed = true; sbSetDot('live'); clearInterval(SB.pollT); SB.pollT = null; refreshBoard(); refreshStats(); }
+      else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED'){ SB.subscribed = false; sbSetDot('poll'); startPolling(); }
+    });
+  // until Realtime confirms, keep the board fresh by polling
+  setTimeout(() => { if (!SB.subscribed){ sbSetDot('poll'); startPolling(); } }, 8000);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible'){ refreshBoard(); refreshStats(); }
+    else if (SB.pending){ clearTimeout(saveT); saveMine(); }       // flush a pending save when the tab is hidden
   });
-  const db = {
-    collection: name => wrapQ(fs.collection(name)),
-    doc: path => { const r = fs.doc(path); return { get: async () => wrapDocSnap(await r.get()), set: d => r.set(d), delete: () => r.delete() }; }
-  };
-  return { db, uid: cred.user.uid, canWrite: true };
+}
+
+// Load (or start) the collection for the name currently typed.
+async function sbLookup(){
+  clearTimeout(SB.nameT);
+  if (SB.pending){ clearTimeout(saveT); await saveMine(); }          // never lose ticks made under the previous name
+  const name = Live.name, key = normName(name);
+  if (!key){
+    SB.boundKey = null; SB.boundName = ''; Live.onBoard = false;
+    if (!SB.draft) Live.have = new Set();
+    Live.msg = 'Write your name to load your collection or start a new one.';
+    renderMine(); renderBoard(); if (current >= 0) renderCardLive(STICKERS[current]);
+    return;
+  }
+  if (key === SB.boundKey){ SB.boundName = name; return; }
+  const seq = ++SB.lookupSeq;
+  Live.msg = 'Looking for your collection…'; renderMine();
+  const { data, error } = await SB.client.rpc('get_collection', { p_name: name });
+  if (seq !== SB.lookupSeq) return;                                  // a newer name was typed meanwhile
+  if (error){ Live.err = 'Couldn’t load your collection. Check your connection and try again.'; renderMine(); return; }
+  Live.err = '';
+  const row = data && data[0];
+  SB.boundKey = key; SB.boundName = name;
+  if (row){
+    const loaded = new Set((row.sticker_ids || []).filter(id => IMAGES[id]));
+    const extra = SB.draft ? [...Live.have].filter(id => !loaded.has(id)) : [];
+    extra.forEach(id => loaded.add(id));
+    Live.have = loaded; Live.onBoard = row.sticker_count > 0;
+    Live.msg = `Welcome back, ${row.display_name}. ${row.sticker_count} sticker${row.sticker_count === 1 ? '' : 's'} loaded.`;
+    SB.draft = false;
+    if (extra.length) queueSave();
+  } else if (SB.draft && Live.have.size){
+    SB.draft = false; Live.msg = 'New collection started.'; queueSave();
+  } else {
+    Live.have = new Set(); Live.onBoard = false; SB.draft = false;
+    Live.msg = 'No collection under this name yet. Tap the stickers you own to start one.';
+  }
+  renderMine(); renderBoard(); if (current >= 0) renderCardLive(STICKERS[current]);
+}
+
+async function initSupabase(cfg){
+  if (!cfg || !cfg.url || !cfg.anonKey) throw new Error('Supabase is not configured');
+  if (looksLikeSecretKey(cfg.anonKey)){
+    console.error('Refusing to start: a secret/service-role key was put in browser config. Use the anon/publishable key.');
+    throw new Error('secret key in browser');
+  }
+  if (!window.supabase) await loadScript(SUPABASE_JS);
+  SB.client = window.supabase.createClient(cfg.url, cfg.anonKey, { auth: { persistSession: false, autoRefreshToken: false } });
+  SB.voter = sbVoterId();
+  Live.mode = 'supabase'; Live.canWrite = true;
+  await Promise.all([sbFetchBoard(), sbFetchStats(), sbLoadMyRatings()]);
+  Live.ready = true;
+  sbSubscribe();
+  Live.name = (($('ntName').value || '') || $('boardName').value || '').trim();
+  $('boardName').value = Live.name;
+  await sbLookup();
 }
 
 async function initLive(){
@@ -1299,7 +1407,11 @@ async function initLive(){
   try {
     let be = null;
     if (window.claude && typeof window.claude.use === 'function') be = await artifactBackend();
-    else if (window.FIREBASE_CONFIG && window.FIREBASE_CONFIG.apiKey) be = await firebaseBackend(window.FIREBASE_CONFIG);
+    else if (window.SUPABASE_CONFIG){
+      await initSupabase(window.SUPABASE_CONFIG);
+      renderBoard(); renderTop(); renderMine(); if (current >= 0) renderCardLive(STICKERS[current]);
+      return;
+    }
     if (!be) throw 0;
     const db = be.db;
     Live.db = db; Live.uid = be.uid; Live.canWrite = be.canWrite;
@@ -1322,8 +1434,9 @@ async function initLive(){
     }
     Live.ready = true;
   } catch (e) {
+    if (e && e.message) console.warn('Leaderboard:', e.message);
     dot.textContent = 'Not connected'; dot.classList.add('off');
-    Live.err = 'The live leaderboard isn’t connected yet.';
+    Live.ready = false; Live.err = 'The live leaderboard isn’t connected right now.';
   }
   if (!Live.name) Live.name = ($('ntName').value || '').trim();
   $('boardName').value = Live.name;
@@ -1331,9 +1444,10 @@ async function initLive(){
 }
 
 let saveT = null, saving = false, saveAgain = false;
-function queueSave(){ clearTimeout(saveT); saveT = setTimeout(saveMine, 700); }
+function queueSave(){ SB.pending = true; clearTimeout(saveT); saveT = setTimeout(saveMine, 800); }   // one request per pause in tapping
 async function saveMine(){
   if (!Live.ready || !Live.canWrite) return;
+  if (Live.mode === 'supabase') return sbSave();
   if (saving){ saveAgain = true; return; }
   saving = true; $('mineStatus').textContent = 'Saving…';
   const ref = Live.db.doc('leaderboard/' + Live.uid);
@@ -1344,23 +1458,67 @@ async function saveMine(){
   } catch (e) { writeErr(e); }
   saving = false; if (saveAgain){ saveAgain = false; saveMine(); }
 }
+async function sbSave(){
+  if (!SB.boundKey){ SB.pending = false; return; }
+  if (saving){ saveAgain = true; return; }
+  saving = true; SB.pending = false; Live.msg = ''; $('mineStatus').textContent = 'Saving…';
+  const key = SB.boundKey, ids = [...Live.have];
+  const { data, error } = await SB.client.rpc('save_collection', { p_name: SB.boundName, p_sticker_ids: ids });
+  if (error){ Live.err = sbFriendly(error); SB.pending = true; }
+  else {
+    const row = data && data[0];
+    Live.err = '';
+    if (row){
+      // the server's de-duplicated list and count are the source of truth
+      if (!saveAgain && key === SB.boundKey) Live.have = new Set(row.sticker_ids.filter(id => IMAGES[id]));
+      Live.onBoard = row.sticker_count > 0;
+      Live.msg = row.sticker_count ? `Saved: ${row.sticker_count} sticker${row.sticker_count === 1 ? '' : 's'} for ${row.display_name}.` : 'Saved. Your collection is empty.';
+    }
+    if (!SB.subscribed) sbFetchBoard().catch(() => {});
+  }
+  saving = false;
+  renderMine(); renderBoard(); if (current >= 0) renderCardLive(STICKERS[current]);
+  if (saveAgain){ saveAgain = false; await sbSave(); }
+}
 let rateSaving = Promise.resolve();
 function rate(id, v){
   if (!Live.ready || !Live.canWrite) return;
   if (Live.mine[id] === v) delete Live.mine[id]; else { Live.mine[id] = v; Sfx.star(v); }   // tap the same star again to clear
   renderCardLive(STICKERS[current]);
+  if (Live.mode === 'supabase'){
+    const stars = Live.mine[id] || 0;
+    rateSaving = rateSaving.then(async () => {
+      const { error } = await SB.client.rpc('rate_sticker', { p_voter: SB.voter, p_sticker: id, p_stars: stars });
+      if (error) throw error;
+      if (!SB.subscribed) await sbFetchStats();
+    }).catch(async e => { try { await sbLoadMyRatings(); } catch (_) {} writeErr(e); });
+    return;
+  }
   const body = { r: { ...Live.mine }, updatedAt: Date.now() };
   rateSaving = rateSaving.then(() => Live.db.doc('ratings/' + Live.uid).set(body)).catch(writeErr);
 }
 function toggleHave(id){
   if (!Live.ready || !Live.canWrite) return;
   Live.have.has(id) ? Live.have.delete(id) : (Live.have.add(id), Sfx.land());
+  if (Live.mode === 'supabase' && !SB.boundKey){
+    SB.draft = true;
+    if (normName(Live.name)) sbLookup();                              // name typed but not loaded yet: load now
+    else Live.msg = 'Write your name above to save these to the leaderboard.';
+    renderMine(); if (current >= 0) renderCardLive(STICKERS[current]);
+    return;
+  }
+  Live.msg = '';
   renderMine(); if (current >= 0) renderCardLive(STICKERS[current]); queueSave();
 }
 function setName(v){
   Live.name = v.trim();
   if ($('boardName').value.trim() !== Live.name) $('boardName').value = Live.name;
   if ($('ntName').value.trim() !== Live.name){ $('ntName').value = Live.name; fitName(); }
+  if (Live.mode === 'supabase'){
+    if (normName(Live.name) === SB.boundKey){ SB.boundName = Live.name; if (Live.onBoard) queueSave(); }
+    else { clearTimeout(SB.nameT); SB.nameT = setTimeout(sbLookup, 700); }
+    return;
+  }
   if (Live.onBoard) queueSave();
 }
 
@@ -1369,7 +1527,7 @@ function renderBoard(){
   const ol = $('rankList');
   if (!Live.board.length){ ol.innerHTML = `<li class="empty-b" style="display:block">No one has counted their stickers yet. Tap the ones you own below to take the top spot.</li>`; return; }
   ol.innerHTML = Live.board.map((p, k) => {
-    const me = p.id === Live.uid;
+    const me = Live.mode === 'supabase' ? p.id === SB.boundKey : p.id === Live.uid;
     return `<li class="${me ? 'me' : ''}"><span class="pos">${k + 1}</span><span class="nm">${esc(p.name || 'A mystery maker')}${me ? '<small>That’s you</small>' : ''}</span><span class="ct">${+p.count || 0}<small>stickers</small></span></li>`;
   }).join('');
 }
@@ -1393,6 +1551,7 @@ function renderMine(){
   $('boardName').disabled = off;
   if (Live.err) $('mineStatus').textContent = Live.err;
   else if (!Live.ready) $('mineStatus').textContent = 'Connecting to the live leaderboard…';
+  else if (!saving && Live.msg) $('mineStatus').textContent = Live.msg;
   else if (!saving) $('mineStatus').textContent = Live.onBoard ? 'You’re on the leaderboard.' : 'Tap the stickers you own to join the leaderboard.';
 }
 function renderCardLive(s){
